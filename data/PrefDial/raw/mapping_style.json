@@ -1,0 +1,12 @@
+{
+  "详细回答型": "detail",
+  "简洁回答型": "simple",
+  "指令式": "directive",
+  "探讨式": "exploratory",
+  "澄清式": "clarification",
+  "对话互动型": "interactive",
+  "角色扮演型": "roleplay",
+  "协作创作型": "collaborative",
+  "轻松随意型": "casual",
+  "正式专业型": "formal"
+}
