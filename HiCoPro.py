@@ -316,7 +316,7 @@ class GraphAwareEncoder(nn.Module):
         gnn_init_from: str = "onehot",
         gnn_seed: int = SEED,
         use_gnn_in_forward: bool = True,
-        use_node_embeddings: bool = True,  # <- 新增开关
+        use_gcls: bool = True,  # <- 新增开关
     ):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(pretrained_model)
@@ -340,17 +340,17 @@ class GraphAwareEncoder(nn.Module):
         # graph retention
         self.graph = graph
 
-        # Node embeddings control
-        self.use_node_embeddings = bool(use_node_embeddings)
-        # if node embeddings are disabled, we cannot compute sim term -> disable gnn-in-forward
-        if not self.use_node_embeddings and use_gnn_in_forward:
+        # gcls control
+        self.use_gcls = bool(use_gcls)
+        # if gcls are disabled, we cannot compute sim term -> disable gnn-in-forward
+        if not self.use_gcls and use_gnn_in_forward:
             print(
-                "[GraphAwareEncoder] WARNING: use_gnn_in_forward requested but use_node_embeddings is False. Disabling use_gnn_in_forward."
+                "[GraphAwareEncoder] WARNING: use_gnn_in_forward requested but use_gcls is False. Disabling use_gnn_in_forward."
             )
             use_gnn_in_forward = False
 
-        # Node embeddings (per-layer) - only create when enabled
-        if self.use_node_embeddings:
+        # gcls (per-layer) - only create when enabled
+        if self.use_gcls:
             self.node_embeddings = nn.ModuleDict()
             for layer, numc in self.num_classes_per_layer.items():
                 emb = nn.Embedding(numc, self.hidden_size)
@@ -363,11 +363,11 @@ class GraphAwareEncoder(nn.Module):
                 p = nn.Parameter(torch.tensor(1.0))
                 self.node_emb_scales[str(layer)] = p
 
-        # whether to run GNN in forward (only meaningful when node embeddings enabled)
-        self.use_gnn_in_forward = bool(use_gnn_in_forward) and self.use_node_embeddings
+        # whether to run GNN in forward (only meaningful when gcls enabled)
+        self.use_gnn_in_forward = bool(use_gnn_in_forward) and self.use_gcls
 
-        # only build global index / GNN modules if node embeddings enabled
-        if self.use_node_embeddings:
+        # only build global index / GNN modules if gcls enabled
+        if self.use_gcls:
             self._build_global_node_index_and_adj()
             gnn_hidden = self.hidden_size
             self._gnn_layers = nn.ModuleList(
@@ -376,7 +376,7 @@ class GraphAwareEncoder(nn.Module):
                     for i in range(gnn_layers)
                 ]
             )
-            # initialize node embeddings via small GNN forward
+            # initialize gcls via small GNN forward
             self._initialize_node_embeddings_with_gnn(
                 gnn_layers, gnn_init_from, gnn_seed
             )
@@ -386,7 +386,7 @@ class GraphAwareEncoder(nn.Module):
             pass
 
     def _compute_dynamic_node_embeddings(self):
-        """Only called when node embeddings enabled."""
+        """Only called when gcls enabled."""
         device = next(self.parameters()).device
         ordered_layers = sorted(self.layer_nodes.keys())
         H_list = []
@@ -486,8 +486,12 @@ class GraphAwareEncoder(nn.Module):
 
     def forward_heads(self, pooled):
         logits = {}
-        # only compute dynamic embeddings if node embeddings enabled and gnn_in_forward set
-        if self.use_node_embeddings and self.use_gnn_in_forward:
+
+        # control Compatibility
+        self.use_compatibility = True
+
+        # only compute dynamic embeddings if gcls enabled and gnn_in_forward set
+        if self.use_gcls and self.use_gnn_in_forward:
             dynamic_embs = self._compute_dynamic_node_embeddings()
         else:
             dynamic_embs = None
@@ -495,8 +499,8 @@ class GraphAwareEncoder(nn.Module):
         for layer, head in self.heads.items():
             layer_i = int(layer)
             base_logit = head(pooled)  # (B, num_classes)
-            if not self.use_node_embeddings:
-                # node embeddings disabled -> return head logits only
+            if not self.use_gcls:
+                # gcls disabled -> return head logits only
                 logits[layer_i] = base_logit
                 continue
 
@@ -507,13 +511,14 @@ class GraphAwareEncoder(nn.Module):
                 W = emb.weight
             sim = pooled @ W.T
             scale = self.node_emb_scales[layer]
-            logits[layer_i] = base_logit + scale * sim
+
+            # shifts the compatibility score to the logits
+            if self.use_compatibility:
+                logits[layer_i] = base_logit + scale * sim
+            else:
+                logits[layer_i] = base_logit
+
         return logits
-
-
-# train_one_epoch / get_allowed_mask_batch_by_gold_parents / evaluate / get_allowed_mask_batch_by_predicted_parents
-# （这些函数保持不变，直接复制原逻辑 -- 在此省略重贴以节省篇幅）
-# 为完整性我把它们放回去（代码中保持与原始版本一致），这里只在实际文件中保留完整实现。
 
 
 def train_one_epoch(
@@ -542,7 +547,7 @@ def train_one_epoch(
             logit = logits[layer]
             target = labels[:, layer]
 
-            if layer > 0:
+            if layer > 0 and args.use_mask_train:
                 parent_layer = layer - 1
                 mask = get_allowed_mask_batch_by_gold_parents(
                     batch["raw_paths"], graph, parent_layer, layer
@@ -550,12 +555,13 @@ def train_one_epoch(
                 inf_mask = (~mask).to(logit.dtype) * (-1e9)
                 logit = logit + inf_mask
 
-                gold_logits = logit.gather(1, target.unsqueeze(1)).squeeze(1)
-                masked_gold = gold_logits < -1e6
+                if args.use_mask_train:
+                    gold_logits = logit.gather(1, target.unsqueeze(1)).squeeze(1)
+                    masked_gold = gold_logits < -1e6
 
-                if masked_gold.any():
-                    target = target.clone()
-                    target[masked_gold] = -100
+                    if masked_gold.any():
+                        target = target.clone()
+                        target[masked_gold] = -100
 
             if target.min() < 0 or target.max() >= logit.size(1):
                 print("🔥 INVALID TARGET DETECTED!")
@@ -659,11 +665,14 @@ def evaluate(
 
             for layer in range(1, 4):
                 logit = logits[layer]
-                mask = get_allowed_mask_batch_by_predicted_parents(
-                    preds[:, layer - 1], graph, layer - 1, layer
-                )
-                inf_mask = (~mask).to(logit.dtype) * (-1e9)
-                logit = logit + inf_mask
+
+                if args.use_mask_infer:
+                    mask = get_allowed_mask_batch_by_predicted_parents(
+                        preds[:, layer - 1], graph, layer - 1, layer
+                    )
+                    inf_mask = (~mask).to(logit.dtype) * (-1e9)
+                    logit = logit + inf_mask
+
                 p = logit.argmax(dim=-1)
                 preds[:, layer] = p
 
@@ -827,9 +836,7 @@ def train_model(args, model, tokenizer, graph):
             {"params": model.heads.parameters(), "lr": heads_lr},
         ]
         # node_embeddings (if present)
-        if getattr(model, "use_node_embeddings", False) and hasattr(
-            model, "node_embeddings"
-        ):
+        if getattr(model, "use_gcls", False) and hasattr(model, "node_embeddings"):
             optimizer_grouped_parameters.append(
                 {"params": model.node_embeddings.parameters(), "lr": heads_lr}
             )
@@ -839,9 +846,7 @@ def train_model(args, model, tokenizer, graph):
                 {"params": model._gnn_layers.parameters(), "lr": gnn_lr}
             )
         # node_emb_scales (if present)
-        if getattr(model, "use_node_embeddings", False) and hasattr(
-            model, "node_emb_scales"
-        ):
+        if getattr(model, "use_gcls", False) and hasattr(model, "node_emb_scales"):
             optimizer_grouped_parameters.append(
                 {"params": list(model.node_emb_scales.values()), "lr": heads_lr}
             )
@@ -918,13 +923,13 @@ def train_model(args, model, tokenizer, graph):
                     layer_metrics,
                 ) = evaluate(model, eval_loader, graph)
 
-                # # ⭐ 只在最好的 epoch 时保存预测结果
+                # ⭐ 只在最好的 epoch 时保存预测结果
                 # if epoch == 46:
                 #     evaluate(
                 #         model,
                 #         eval_loader,
                 #         graph,
-                #         save_predictions_path="val_preds.npz",
+                #         save_predictions_path="best_model.npz",
                 #     )
 
                 print("\n========== 训练日志 ==========")
@@ -1035,20 +1040,32 @@ if __name__ == "__main__":
         help=("某一层从开始参与训练到达到完整权重的线性爬坡轮数。"),
     )
 
-    # ===== Node Embeddings 开关（新增） =====
+    # ===== gcls 开关 =====
     parser.add_argument(
-        "--use_node_embeddings",
-        dest="use_node_embeddings",
+        "--use_gcls",
+        dest="use_gcls",
         action="store_true",
-        help="启用 per-layer learnable node embeddings（默认启用）。",
+        help="启用 per-layer learnable gcls（默认启用）。",
     )
     parser.add_argument(
-        "--no_node_embeddings",
-        dest="use_node_embeddings",
+        "--no_gcls",
+        dest="use_gcls",
         action="store_false",
-        help="禁用 per-layer learnable node embeddings（只使用 head logits，不加 sim）。",
+        help="禁用 per-layer learnable gcls（只使用 head logits，不加 sim）。",
     )
-    parser.set_defaults(use_node_embeddings=True)
+    # 默认开启 gcls
+    parser.set_defaults(use_gcls=True)
+
+    # self.use_compatibility
+
+    parser.add_argument(
+        "--use_mask_train", action="store_true", help="训练时使用层级mask"
+    )
+    parser.add_argument(
+        "--use_mask_infer", action="store_true", help="推理时使用层级mask"
+    )
+    # 默认都关闭
+    parser.set_defaults(use_mask_train=False, use_mask_infer=False)
 
     args = parser.parse_args()
 
@@ -1061,8 +1078,8 @@ if __name__ == "__main__":
         args.pretrained,
         graph,
         gnn_layers=args.gnn_layers,
-        use_gnn_in_forward=True,  # keep default behavior, GraphAwareEncoder 内部会与 use_node_embeddings 协调
-        use_node_embeddings=args.use_node_embeddings,
+        use_gnn_in_forward=True,  # keep default behavior, GraphAwareEncoder 内部会与 use_gcls 协调
+        use_gcls=args.use_gcls,
     )
     model.to(DEVICE)
 
